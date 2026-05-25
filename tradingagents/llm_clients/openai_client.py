@@ -14,6 +14,75 @@ class NormalizedChatOpenAI(ChatOpenAI):
         return normalize_content(super().invoke(input, config, **kwargs))
 
 
+# =============================================================================
+# 🩹 PATCH: Fix reasoning_content handling for thinking-mode models
+# (e.g. QwQ, DeepSeek-R1 via DashScope OpenAI-compatible API)
+# =============================================================================
+# DashScope's compatible-mode requires `reasoning_content` to be passed back
+# in multi-turn conversations, but langchain_openai drops this field during
+# message serialization. We monkey-patch the two conversion functions so
+# `reasoning_content` is preserved round-trip.
+# =============================================================================
+
+def _apply_reasoning_content_patch():
+    """Monkey-patch langchain_openai base conversion functions."""
+    try:
+        import langchain_openai.chat_models.base as _base
+        from langchain_core.messages import AIMessage
+
+        # ------------------------------------------------------------------
+        # 1) Patch _convert_dict_to_message  (API response -> LangChain msg)
+        # ------------------------------------------------------------------
+        _orig_convert_dict_to_message = _base._convert_dict_to_message
+
+        def _patched_convert_dict_to_message(_dict):
+            message = _orig_convert_dict_to_message(_dict)
+            # 🩹 Preserve reasoning_content for assistant messages
+            if (
+                isinstance(message, AIMessage)
+                and "reasoning_content" in _dict
+            ):
+                message.additional_kwargs["reasoning_content"] = _dict[
+                    "reasoning_content"
+                ]
+            return message
+
+        _base._convert_dict_to_message = _patched_convert_dict_to_message
+
+        # ----------------------------------/--------------------------------
+        # 2) Patch _convert_message_to_dict  (LangChain msg -> API request)
+        # ------------------------------------------------------------------
+        _orig_convert_message_to_dict = _base._convert_message_to_dict
+
+        def _patched_convert_message_to_dict(message, api="chat/completions"):
+            message_dict = _orig_convert_message_to_dict(message, api)
+            # 🩹 Pass reasoning_content back to the API for assistant messages
+            if isinstance(message, AIMessage):
+                reasoning_content = message.additional_kwargs.get(
+                    "reasoning_content"
+                )
+                if reasoning_content:
+                    message_dict["reasoning_content"] = reasoning_content
+            return message_dict
+
+        _base._convert_message_to_dict = _patched_convert_message_to_dict
+
+    except Exception:
+        # If patching fails for any reason, leave the original code untouched
+        # so the application can still start.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "⚠️ Failed to apply reasoning_content patch to langchain_openai."
+            " Thinking-mode models may fail on multi-turn tool calls.",
+            exc_info=True,
+        )
+
+
+# Apply patch once at module import time
+_apply_reasoning_content_patch()
+
+
 _PASSTHROUGH_KWARGS = (
     "temperature",
     "max_tokens",
