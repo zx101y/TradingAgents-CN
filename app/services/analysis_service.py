@@ -96,7 +96,7 @@ class AnalysisService:
 
         return self._trading_graph_cache[config_key]
 
-    def _execute_analysis_sync_with_progress(self, task: AnalysisTask, progress_tracker: RedisProgressTracker) -> AnalysisResult:
+    def _execute_analysis_sync_with_progress(self, task: AnalysisTask, symbol: str, progress_tracker: RedisProgressTracker) -> AnalysisResult:
         """同步执行分析任务（在线程池中运行，带进度跟踪）"""
         try:
             # 在线程中重新初始化日志系统
@@ -104,8 +104,9 @@ class AnalysisService:
             init_logging()
             thread_logger = get_logger('analysis_thread')
 
-            thread_logger.info(f"🔄 [线程池] 开始执行分析任务: {task.task_id} - {task.symbol}")
-            logger.info(f"🔄 [线程池] 开始执行分析任务: {task.task_id} - {task.symbol}")
+            # 🔥 使用传入的 symbol 字符串，不再依赖 task.symbol
+            thread_logger.info(f"🔄 [线程池] 开始执行分析任务: {task.task_id} - {symbol}")
+            logger.info(f"🔄 [线程池] 开始执行分析任务: {task.task_id} - {symbol}")
 
             # 环境检查
             progress_tracker.update_progress("🔧 检查环境配置")
@@ -204,7 +205,7 @@ class AnalysisService:
                 progress_tracker.update_progress(message)
 
             # 调用现有的分析方法（同步调用，传递进度回调）
-            _, decision = trading_graph.propagate(task.symbol, analysis_date, progress_callback)
+            _, decision = trading_graph.propagate(symbol, analysis_date, progress_callback)
 
             execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
 
@@ -376,12 +377,17 @@ class AnalysisService:
 
             loop = asyncio.get_event_loop()
 
+            # 🔥 提取股票代码作为字符串传递，避免 Pydantic 对象在线程池中丢失字段
+            symbol = task.symbol
+            logger.info(f"🚀 [AnalysisService] 提交到线程池: {task.task_id} - symbol={symbol!r}")
+
             # 使用线程池执行器运行同步的分析代码
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 result = await loop.run_in_executor(
                     executor,
                     self._execute_analysis_sync_with_progress,
                     task,
+                    symbol,
                     progress_tracker
                 )
 

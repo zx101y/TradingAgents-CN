@@ -971,13 +971,15 @@ class SimpleAnalysisService:
                 from app.services.notifications_service import get_notifications_service
                 svc = get_notifications_service()
                 summary = str(result.get("summary", ""))[:120]
+                # 🔥 使用 result 中的 stock_symbol，不再依赖 request 对象
+                notify_symbol = result.get("stock_symbol") or result.get("stock_code") or stock_code or "UNKNOWN"
                 await svc.create_and_publish(
                     payload=NotificationCreate(
                         user_id=str(user_id),
                         type='analysis',
-                        title=f"{request.stock_code} 分析完成",
+                        title=f"{notify_symbol} 分析完成",
                         content=summary,
-                        link=f"/stocks/{request.stock_code}",
+                        link=f"/stocks/{notify_symbol}",
                         source='analysis'
                     )
                 )
@@ -1045,22 +1047,50 @@ class SimpleAnalysisService:
         # 🔧 使用共享线程池，支持多个任务并发执行
         # 不再每次创建新的线程池，避免串行执行
         loop = asyncio.get_event_loop()
-        logger.info(f"🚀 [线程池] 提交分析任务到共享线程池: {task_id} - {request.stock_code}")
+
+        # 🔥 CRITICAL FIX: 在主协程中提取股票代码，避免 Pydantic 对象在线程池传递中丢失字段
+        # 直接传递不可变的字符串到线程池，而不是依赖 request 对象
+        stock_symbol = request.get_symbol()
+        logger.info(f"🚀 [线程池] 提交分析任务到共享线程池: {task_id} - stock_symbol={stock_symbol!r}")
+
+        # 防御性检查：如果 stock_symbol 为空，尝试从 MongoDB 读取
+        if not stock_symbol:
+            logger.warning(f"⚠️ [线程池] request.get_symbol() 返回空值，尝试从 MongoDB 读取: {task_id}")
+            try:
+                db = get_mongo_db()
+                task_doc = await db.analysis_tasks.find_one({"task_id": task_id})
+                if task_doc:
+                    stock_symbol = (
+                        task_doc.get("stock_symbol")
+                        or task_doc.get("stock_code")
+                        or task_doc.get("symbol")
+                        or "UNKNOWN"
+                    )
+                    logger.info(f"✅ [线程池] 从 MongoDB 读取到股票代码: {stock_symbol!r}")
+                else:
+                    stock_symbol = "UNKNOWN"
+                    logger.error(f"❌ [线程池] MongoDB 中找不到任务记录: {task_id}")
+            except Exception as e:
+                logger.error(f"❌ [线程池] 从 MongoDB 读取股票代码失败: {e}")
+                stock_symbol = "UNKNOWN"
+
         result = await loop.run_in_executor(
             self._thread_pool,  # 使用共享线程池
             self._run_analysis_sync,
             task_id,
             user_id,
+            stock_symbol,  # 🔥 传递字符串而非 Pydantic 对象
             request,
             progress_tracker
         )
-        logger.info(f"✅ [线程池] 分析任务执行完成: {task_id}")
+        logger.info(f"✅ [线程池] 分析任务执行完成: {task_id} - result_stock={result.get('stock_symbol')!r}")
         return result
 
     def _run_analysis_sync(
         self,
         task_id: str,
         user_id: str,
+        stock_symbol: str,
         request: SingleAnalysisRequest,
         progress_tracker: Optional[RedisProgressTracker] = None
     ) -> Dict[str, Any]:
@@ -1071,8 +1101,52 @@ class SimpleAnalysisService:
             init_logging()
             thread_logger = get_logger('analysis_thread')
 
-            thread_logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {request.stock_code}")
-            logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {request.stock_code}")
+            # 🔥 CRITICAL FIX: 使用从主协程显式传递的 stock_symbol，不再依赖 request 对象
+            # 同时用 MongoDB 做双重验证
+            resolved_stock_symbol = stock_symbol
+            try:
+                from pymongo import MongoClient
+                from app.core.config import settings
+                sync_client = MongoClient(settings.MONGO_URI)
+                sync_db = sync_client[settings.MONGO_DB]
+                task_doc = sync_db.analysis_tasks.find_one({"task_id": task_id})
+                if task_doc:
+                    db_stock_symbol = (
+                        task_doc.get("stock_symbol")
+                        or task_doc.get("stock_code")
+                        or task_doc.get("symbol")
+                    )
+                    # 如果 MongoDB 中的值与传入的值不一致，优先使用传入的值（它来自 create_analysis_task）
+                    if db_stock_symbol and db_stock_symbol != resolved_stock_symbol:
+                        thread_logger.warning(
+                            f"⚠️ [线程池] stock_symbol 不一致: 传入={resolved_stock_symbol!r}, "
+                            f"MongoDB={db_stock_symbol!r}, 使用传入值"
+                        )
+                    elif db_stock_symbol:
+                        resolved_stock_symbol = db_stock_symbol
+                sync_client.close()
+            except Exception as e:
+                thread_logger.warning(f"⚠️ [线程池] MongoDB 验证股票代码失败: {e}，使用传入值={resolved_stock_symbol!r}")
+
+            # 最终防线：确保 resolved_stock_symbol 不为空
+            if not resolved_stock_symbol:
+                resolved_stock_symbol = "UNKNOWN"
+                thread_logger.error(f"❌ [线程池] stock_symbol 为空，已回退到 UNKNOWN")
+
+            thread_logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {resolved_stock_symbol}")
+            logger.info(f"🔄 [线程池] 开始执行分析: {task_id} - {resolved_stock_symbol}")
+
+            # 🔥 CRITICAL DEBUG: verify request state in thread pool
+            logger.critical(
+                f"[DEBUG-THREAD] task_id={task_id} "
+                f"passed_stock_symbol={stock_symbol!r} "
+                f"resolved_stock_symbol={resolved_stock_symbol!r} "
+                f"request_type={type(request).__name__} "
+                f"request.symbol={getattr(request, 'symbol', 'N/A')!r} "
+                f"request.stock_code={getattr(request, 'stock_code', 'N/A')!r} "
+                f"request.get_symbol()={request.get_symbol()!r} "
+                f"task_doc_stock={task_doc.get('stock_symbol') if task_doc else 'NO_DOC'!r}"
+            )
 
             # 🔧 根据 RedisProgressTracker 的步骤权重计算准确的进度
             # 基础准备阶段 (10%): 0.03 + 0.02 + 0.01 + 0.02 + 0.02 = 0.10
@@ -1474,7 +1548,7 @@ class SimpleAnalysisService:
 
             # 执行实际分析，传递进度回调和task_id
             state, decision = trading_graph.propagate(
-                request.stock_code,
+                resolved_stock_symbol,
                 analysis_date,
                 progress_callback=graph_progress_callback,
                 task_id=task_id
@@ -1744,7 +1818,7 @@ class SimpleAnalysisService:
 
             # 5. 最后的备用方案
             if not summary:
-                summary = f"对{request.stock_code}的分析已完成，请查看详细报告。"
+                summary = f"对{resolved_stock_symbol}的分析已完成，请查看详细报告。"
                 logger.warning(f"⚠️ [SUMMARY] 使用备用摘要")
 
             if not recommendation:
@@ -1757,8 +1831,8 @@ class SimpleAnalysisService:
             # 构建结果
             result = {
                 "analysis_id": str(uuid.uuid4()),
-                "stock_code": request.stock_code,
-                "stock_symbol": request.stock_code,  # 添加stock_symbol字段以保持兼容性
+                "stock_code": resolved_stock_symbol,
+                "stock_symbol": resolved_stock_symbol,  # 添加stock_symbol字段以保持兼容性
                 "analysis_date": analysis_date,
                 "summary": summary,
                 "recommendation": recommendation,
@@ -1786,6 +1860,7 @@ class SimpleAnalysisService:
 
             # 🔍 调试：检查返回的result结构
             logger.info(f"🔍 [DEBUG] 返回result的键: {list(result.keys())}")
+            logger.info(f"🔍 [DEBUG] 返回result中stock_symbol={result.get('stock_symbol')!r} stock_code={result.get('stock_code')!r}")
             logger.info(f"🔍 [DEBUG] 返回result中有decision: {bool(result.get('decision'))}")
             if result.get('decision'):
                 decision = result['decision']
@@ -2364,8 +2439,32 @@ class SimpleAnalysisService:
             # 生成分析ID（与web目录保持一致）
             from datetime import datetime
             timestamp = datetime.utcnow()  # 存储 UTC 时间（标准做法）
-            stock_symbol = result.get('stock_symbol') or result.get('stock_code', 'UNKNOWN')
+            stock_symbol = result.get('stock_symbol') or result.get('stock_code')
+            logger.info(f"🔍 [_save_analysis_result_web_style] task_id={task_id} result_stock_symbol={result.get('stock_symbol')!r} result_stock_code={result.get('stock_code')!r} initial_stock_symbol={stock_symbol!r}")
+
+            # 🩹 Fallback: if stock_symbol is missing from result, read from the task record
+            if not stock_symbol:
+                logger.warning(f"⚠️ [_save_analysis_result_web_style] result 中无 stock_symbol，尝试从 MongoDB 读取: {task_id}")
+                task_doc = await db.analysis_tasks.find_one({"task_id": task_id})
+                if task_doc:
+                    stock_symbol = (
+                        task_doc.get("stock_symbol")
+                        or task_doc.get("stock_code")
+                        or task_doc.get("symbol")
+                        or "UNKNOWN"
+                    )
+                    logger.info(f"✅ [_save_analysis_result_web_style] 从 MongoDB 读取到 stock_symbol={stock_symbol!r}")
+                else:
+                    stock_symbol = "UNKNOWN"
+                    logger.error(f"❌ [_save_analysis_result_web_style] MongoDB 中找不到任务记录，使用 UNKNOWN: {task_id}")
+
+            # 最终防线：确保 stock_symbol 不是 None 或空字符串
+            if not stock_symbol or str(stock_symbol).lower() in ("none", "null", ""):
+                logger.error(f"❌ [_save_analysis_result_web_style] stock_symbol 为无效值 {stock_symbol!r}，强制回退到 UNKNOWN: {task_id}")
+                stock_symbol = "UNKNOWN"
+
             analysis_id = f"{stock_symbol}_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+            logger.info(f"✅ [_save_analysis_result_web_style] 生成 analysis_id={analysis_id}")
 
             # 处理reports字段 - 从state中提取所有分析报告
             reports = {}
@@ -2653,7 +2752,20 @@ class SimpleAnalysisService:
             logger.info(f"🔍 [调试] stock_symbol: {result.get('stock_symbol', 'NOT_FOUND')}")
 
             # 优先使用stock_symbol，如果没有则使用stock_code
-            stock_symbol = result.get('stock_symbol') or result.get('stock_code', 'UNKNOWN')
+            stock_symbol = result.get('stock_symbol') or result.get('stock_code')
+            # 🩹 Fallback: read from task record if missing
+            if not stock_symbol:
+                db = get_mongo_db()
+                task_doc = await db.analysis_tasks.find_one({"task_id": task_id})
+                if task_doc:
+                    stock_symbol = (
+                        task_doc.get("stock_symbol")
+                        or task_doc.get("stock_code")
+                        or task_doc.get("symbol")
+                        or "UNKNOWN"
+                    )
+                else:
+                    stock_symbol = "UNKNOWN"
             logger.info(f"💾 开始完整保存分析结果: {stock_symbol}")
 
             # 1. 保存分模块报告到本地目录
