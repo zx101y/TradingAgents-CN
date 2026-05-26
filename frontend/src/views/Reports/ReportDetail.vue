@@ -204,14 +204,14 @@
       </el-card>
 
       <!-- 报告摘要 -->
-      <el-card v-if="report.summary" class="summary-card" shadow="never">
+      <el-card v-if="displaySummary" class="summary-card" shadow="never">
         <template #header>
           <div class="card-header">
             <el-icon><InfoFilled /></el-icon>
             <span>执行摘要</span>
           </div>
         </template>
-        <div class="summary-content markdown-content" v-html="renderMarkdown(report.summary)"></div>
+        <div class="summary-content markdown-content" v-html="renderMarkdown(displaySummary)"></div>
       </el-card>
 
       <!-- 报告模块 -->
@@ -324,6 +324,22 @@ const report = ref<ReportDetailData | null>(null)
 const activeModule = ref('')
 const llmConfigs = ref<LLMConfig[]>([]) // 存储所有模型配置
 const reportModuleKeys = computed<string[]>(() => report.value ? Object.keys(report.value.reports || {}) : [])
+
+// 执行摘要显示内容：如果 summary 被截断，尝试使用完整报告替代
+const displaySummary = computed(() => {
+  if (!report.value) return ''
+  const summary = report.value.summary || ''
+  const reports = report.value.reports || {}
+  // 如果 summary 看起来被截断了（以 ... 结尾且长度较短），尝试使用完整报告
+  if (summary.length > 0 && summary.length < 500 && summary.endsWith('...')) {
+    // 优先使用风险管理层决策或最终交易决策的完整内容
+    const fullReport = reports.risk_management_decision || reports.final_trade_decision || ''
+    if (typeof fullReport === 'string' && fullReport.length > summary.length) {
+      return fullReport
+    }
+  }
+  return summary
+})
 
 // 获取模型配置列表
 const fetchLLMConfigs = async () => {

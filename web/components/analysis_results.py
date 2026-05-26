@@ -224,10 +224,8 @@ def load_analysis_results(start_date=None, end_date=None, stock_symbol=None, ana
 
                                 # 如果是最终决策报告，提取摘要
                                 if report_name == "final_trade_decision":
-                                    # 提取前200个字符作为摘要
-                                    summary_content = content[:200].replace('#', '').replace('*', '').strip()
-                                    if len(content) > 200:
-                                        summary_content += "..."
+                                    # 保留完整内容作为摘要（不再截断到200字符）
+                                    summary_content = content.strip()
 
                         except Exception as e:
                             continue

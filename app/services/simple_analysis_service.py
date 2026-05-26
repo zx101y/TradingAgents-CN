@@ -1776,19 +1776,15 @@ class SimpleAnalysisService:
             if isinstance(reports, dict) and 'final_trade_decision' in reports:
                 final_decision_content = reports['final_trade_decision']
                 if isinstance(final_decision_content, str) and len(final_decision_content) > 50:
-                    # 提取前200个字符作为摘要（与web目录完全一致）
-                    summary = final_decision_content[:200].replace('#', '').replace('*', '').strip()
-                    if len(final_decision_content) > 200:
-                        summary += "..."
+                    # 保留完整内容作为摘要（不再截断到200字符）
+                    summary = final_decision_content.strip()
                     logger.info(f"📝 [SUMMARY] 从final_trade_decision提取摘要: {len(summary)}字符")
 
             # 2. 如果没有final_trade_decision，从state中提取
             if not summary and isinstance(state, dict):
                 final_decision = state.get('final_trade_decision', '')
                 if isinstance(final_decision, str) and len(final_decision) > 50:
-                    summary = final_decision[:200].replace('#', '').replace('*', '').strip()
-                    if len(final_decision) > 200:
-                        summary += "..."
+                    summary = final_decision.strip()
                     logger.info(f"📝 [SUMMARY] 从state.final_trade_decision提取摘要: {len(summary)}字符")
 
             # 3. 生成recommendation（从decision的reasoning）
@@ -1810,9 +1806,7 @@ class SimpleAnalysisService:
                 # 尝试从其他报告中提取摘要
                 for report_name, content in reports.items():
                     if isinstance(content, str) and len(content) > 100:
-                        summary = content[:200].replace('#', '').replace('*', '').strip()
-                        if len(content) > 200:
-                            summary += "..."
+                        summary = content.strip()
                         logger.info(f"📝 [SUMMARY] 从{report_name}提取摘要: {len(summary)}字符")
                         break
 
